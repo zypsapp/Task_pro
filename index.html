@@ -24,8 +24,8 @@
 <script>
 // Firebase removed — Supabase handles cloud sync (free, no credit card)
 window._FB          = { on: false };
-window.fbPushData   = function() { window.toast && window.toast('Use Supabase sync in Settings → Cloud Sync.','info'); };
-window.fbPullData   = function() { window.toast && window.toast('Use Supabase sync in Settings → Cloud Sync.','info'); };
+window.fbPushData   = function() { window.toast && window.toast('Use Settings → Backup & Sync → Sign in with Google.','info'); };
+window.fbPullData   = function() { window.toast && window.toast('Use Settings → Backup & Sync → Sign in with Google.','info'); };
 window.fbSignInGoogle  = function() { document.getElementById('auth-modal')?.classList.remove('open'); window.showModal && window.showModal('supabase-info-modal'); };
 window.fbSignOut       = function() {};
 window.fbSendEmailLink = function() {};
@@ -438,7 +438,8 @@ w.QRCode.CorrectLevel=QRErrorCorrectLevel;
   .btn-sm { padding: 6px 12px; font-size: 12px; }
 
   /* ── TASK TABLE ── */
-  .table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); }
+  .table-wrap { overflow-x: auto; overflow-y: auto; border-radius: var(--radius); border: 1px solid var(--border); -webkit-overflow-scrolling: touch; }
+  #page-all .table-wrap { max-height: calc(100vh - 220px); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1200px; }
   thead th {
     background: var(--surface); padding: 11px 14px;
@@ -910,17 +911,26 @@ w.QRCode.CorrectLevel=QRErrorCorrectLevel;
 </style>
 
 <!-- Google Identity Services for Drive sync -->
-<!-- Google Drive OAuth not configured: _gdriveClientId requires a Google Cloud
-     Console OAuth2 Client ID. Until configured, sync is manual backup only.
-     To enable: create an OAuth2 credential at console.cloud.google.com,
-     set _gdriveClientId in the Drive sync script block below. -->
+<!-- ══ GOOGLE SIGN-IN ══════════════════════════════════════════════════
+     SETUP (one time, free):
+     1. Go to https://console.cloud.google.com
+     2. Create project → APIs & Services → Credentials
+     3. Create OAuth2 Client ID → Web application
+     4. Authorised JavaScript origins: https://task.zypsapp.com
+     5. Copy the Client ID and paste it into _gdriveClientId below
+     SRI note: Google rotates this file so a fixed integrity hash would
+     break on every update — accepted risk, see compensating controls. -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 // ── GOOGLE DRIVE SYNC ──────────────────────────────────────────────────────
 // Uses Google Identity Services (free, no Firebase, no backend)
 // Stores data as a JSON file in user's own Google Drive (appDataFolder)
 var _gdriveToken = null;
 var _gdriveTokenExp = 0;
-var _gdriveClientId = 'YOUR_GOOGLE_CLIENT_ID'; // Set this after creating OAuth2 credentials
+// ▼▼▼ PASTE YOUR GOOGLE OAUTH2 CLIENT ID HERE ▼▼▼
+// Get it from: console.cloud.google.com → APIs & Services → Credentials → OAuth2 Client ID
+// Authorised origin must include: https://task.zypsapp.com
+var _gdriveClientId = 519542609285-1gb2infl6iors52v199nbfbpuo894uaa.apps.googleusercontent.com;
 
 function _gdriveSignIn() {
   return new Promise(function(resolve, reject) {
@@ -944,6 +954,9 @@ function _gdriveSignIn() {
         // Show disconnect row in settings
         const _dcRow = document.getElementById('gdrive-connected-row');
         if (_dcRow) _dcRow.style.display = 'flex';
+        // Show sign-out button in header
+        var _soBtn = document.getElementById('signout-btn');
+        if (_soBtn) _soBtn.style.display = 'inline-flex';
         resolve(resp);
       }
     });
@@ -952,6 +965,71 @@ function _gdriveSignIn() {
 }
 
 var _gdriveSignInPromise = null;
+
+// ── DEVICE IDENTITY ──────────────────────────────────────────────────────
+// Generates a stable ID for this device. Used for 3-device limit enforcement.
+// Not cryptographically guaranteed but sufficient for honest-use enforcement.
+async function _getDeviceId() {
+  // screen.width/height excluded — they change on rotation/scaling and cause
+  // a new device slot to be consumed, locking out the user on their own device.
+  // userAgent + timezone + language + CPU cores is sufficient to distinguish devices.
+  const raw = [
+    navigator.userAgent,
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    navigator.language,
+    navigator.hardwareConcurrency || 0
+  ].join('|');
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+  return Array.from(new Uint8Array(buf)).slice(0,8).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+// ENFORCEMENT NOTE: _MAX_DEVICES is a client-side constant.
+// A user can bypass it via DevTools or by editing their Drive backup JSON.
+// This is honest-use enforcement only — not a hard cryptographic gate.
+// Do not describe this as an unbypassable device limit in product docs.
+var _MAX_DEVICES = 3;
+
+function _validateDevices(arr) {
+  // Sanitise device array from Drive before writing to localStorage
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .slice(0, 20) // cap: prevent storage bomb
+    .map(function(d) {
+      if (!d || typeof d !== 'object') return null;
+      return {
+        id:        String(d.id        || '').slice(0, 16),
+        name:      String(d.name      || '').slice(0, 80),
+        firstSeen: String(d.firstSeen || '').slice(0, 30),
+        lastSeen:  String(d.lastSeen  || '').slice(0, 30)
+      };
+    })
+    .filter(function(d) { return d && d.id; });
+}
+
+async function _checkAndRegisterDevice(driveData) {
+  // NOTE: This check only runs on Drive pull. A user who only pushes,
+  // or who edits their Drive JSON directly, can bypass the device limit.
+  // This is honest-use enforcement — not a cryptographic gate.
+  var deviceId = await _getDeviceId();
+  var devices  = Array.isArray(driveData.devices) ? driveData.devices : [];
+  var now      = new Date().toISOString();
+  // Is this device already registered?
+  var existing = devices.find(function(d) { return d.id === deviceId; });
+  if (existing) {
+    existing.lastSeen = now; // update last-seen timestamp
+    return { allowed: true, devices: devices, deviceId: deviceId };
+  }
+  // New device — check limit
+  if (devices.length >= _MAX_DEVICES) {
+    return { allowed: false, devices: devices, deviceId: deviceId,
+      message: 'This license is already active on ' + devices.length + ' devices (max ' + _MAX_DEVICES + ').\n'
+             + 'To use this device, sign in on one of your other devices and remove it from Settings → Devices.' };
+  }
+  // Register new device
+  devices.push({ id: deviceId, name: navigator.userAgent.split(' ').slice(-2).join(' '), firstSeen: now, lastSeen: now });
+  return { allowed: true, devices: devices, deviceId: deviceId };
+}
+
 async function _gdriveGetToken() {
   if (_gdriveToken && Date.now() < _gdriveTokenExp) return _gdriveToken;
   // Deduplicate concurrent calls — prevents double OAuth popup
@@ -974,7 +1052,9 @@ async function gdriveSync(direction) {
       // FIX 10: use in-memory arrays, not re-parsed localStorage
       const safeSet = Object.assign({}, settings);
       delete safeSet.gcalKey; delete safeSet.twilioToken; delete safeSet.twilioSid; delete safeSet.sbKey; delete safeSet.sbUrl;
-      const payload = { tasks: tasks, alarms: alarms, settings: safeSet, ts: Date.now() };
+      // Include device registry so limit is preserved across pushes
+      var _storedDevices = _validateDevices(JSON.parse(localStorage.getItem('dcp_devices') || '[]'));
+      const payload = { tasks: tasks, alarms: alarms, settings: safeSet, devices: _storedDevices, ts: Date.now() };
 
       // FIX 2: check HTTP status on list
       const listResp = await fetch(
@@ -1031,6 +1111,15 @@ async function gdriveSync(direction) {
       const d = await fileResp.json();
       if (d && d.error) throw new Error('Drive API error ' + d.error.code + ': ' + d.error.message);
 
+      // Device limit check — max 3 devices per account
+      var _devCheck = await _checkAndRegisterDevice(d);
+      if (!_devCheck.allowed) {
+        setStatus('❌ Device limit reached');
+        alert(_devCheck.message);
+        throw new Error('Device limit reached');
+      }
+      d.devices = _devCheck.devices; // keep updated device list in payload
+
       // FIX 3: timestamp guard — warn if cloud is older than local
       const localTs = parseInt(localStorage.getItem('dcp_last_save') || '0');
       if (d.ts && localTs && d.ts < localTs) {
@@ -1047,9 +1136,13 @@ async function gdriveSync(direction) {
       if (d.tasks)    { const v = _validateTaskArray(d.tasks);    if (v.length) { safeSave('dcp_tasks', JSON.stringify(v)); tasks = v; } }
       if (d.alarms)   { const v = _validateAlarmArray(d.alarms);  if (v.length) { safeSave('dcp_alarms', JSON.stringify(v)); alarms = v; } }
       if (d.settings) { const v = _validateSettings(d.settings);  if (v) { safeSave('dcp_settings', JSON.stringify(v)); Object.assign(settings, v); } }
+      // Persist device registry locally for use in next push
+      if (d.devices) safeSave('dcp_devices', JSON.stringify(_validateDevices(d.devices)));
       renderToday(); renderAll(); renderStats(); renderReminders();
       setStatus('✅ Loaded from Google Drive at ' + new Date().toLocaleTimeString());
       toast('✅ Data loaded from Google Drive!', 'success');
+      // Refresh device manager UI
+      if (typeof renderDeviceList === 'function') renderDeviceList();
       // Clean up snapshot after 60 s — gives user time to notice bad pull, then frees storage
       setTimeout(function() { localStorage.removeItem('dcp_pre_pull_snapshot'); }, 60000);
     }
@@ -1058,6 +1151,53 @@ async function gdriveSync(direction) {
     logError('gdriveSync', e);
   }
 }
+async function renderDeviceList() {
+  var mgr  = document.getElementById('device-manager');
+  var list = document.getElementById('device-list');
+  if (!mgr || !list) return;
+  var devices = JSON.parse(localStorage.getItem('dcp_devices') || '[]');
+  if (!devices.length) { mgr.style.display = 'none'; return; }
+  mgr.style.display = 'block';
+  var myId = await _getDeviceId();
+  list.innerHTML = devices.map(function(d, i) {
+    var isMe = d.id === myId;
+    return '<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">'
+      + '<span style="flex:1">' + (isMe ? '📱 ' : '💻 ') + esc(d.name || 'Device ' + (i+1))
+      + (isMe ? ' <em style="color:var(--success)">(this device)</em>' : '')
+      + '</span>'
+      + (isMe ? '' : '<button onclick="removeDevice(' + i + ')" style="background:none;border:1px solid var(--border);border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer;color:var(--error)">Remove</button>')
+      + '</div>';
+  }).join('');
+}
+
+async function removeDevice(idx) {
+  if (!confirm('Remove this device? It will need to sign in again to access your data.')) return;
+  var devices = JSON.parse(localStorage.getItem('dcp_devices') || '[]');
+  devices.splice(idx, 1);
+  safeSave('dcp_devices', JSON.stringify(devices));
+  // Push updated device list to Drive immediately
+  try { await gdriveSync('push'); } catch(_) {}
+  renderDeviceList();
+  toast('Device removed.', 'info');
+}
+
+function signOutGoogle() {
+  if (!confirm('Sign out of Google?\n\nYour data stays on this device. You can sign in again anytime.')) return;
+  // Revoke token and clear Drive credentials
+  gdriveDisconnect();
+  // Hide sign-out button, show signed-out state
+  var soBtn = document.getElementById('signout-btn');
+  if (soBtn) soBtn.style.display = 'none';
+  var authBtn = document.getElementById('auth-btn');
+  if (authBtn) authBtn.title = 'Sign in with Google';
+  // Update settings Drive section
+  var gdRow = document.getElementById('gdrive-connected-row');
+  if (gdRow) gdRow.style.display = 'none';
+  var gdStatus = document.getElementById('gdrive-status');
+  if (gdStatus) gdStatus.textContent = 'Signed out.';
+  toast('Signed out of Google Drive.', 'info');
+}
+
 function gdriveDisconnect() {
   // Revoke token if Google lib is available, then clear local state
   if (window.google && window.google.accounts && window.google.accounts.oauth2 && _gdriveToken) {
@@ -1081,6 +1221,11 @@ document.addEventListener('DOMContentLoaded', function() {
     setTimeout(function() {
       _gdriveSignIn().catch(function() { localStorage.removeItem('gdrive_signed_in'); });
     }, 2000);
+  }
+  // Show sign-out button if already signed in on this device
+  if (localStorage.getItem('gdrive_signed_in') === '1') {
+    var _soB = document.getElementById('signout-btn');
+    if (_soB) _soB.style.display = 'inline-flex';
   }
 });
 </script>
@@ -1154,12 +1299,19 @@ document.addEventListener('DOMContentLoaded', function() {
         <div style="font-size:12px;font-weight:700;margin-bottom:8px;display:flex;align-items:center;gap:6px">
           <span>💾</span> Your data &amp; privacy
         </div>
-        <div style="font-size:12px;color:var(--muted);line-height:1.8">
-          ✅ <strong>No account needed</strong> — Zyps Task Pro works completely offline.<br>
-          ✅ All data stays on <strong>your device</strong>, never uploaded to any server.<br>
-          ✅ To back up or move to another device, use <strong>Settings → Backup my data</strong>.
+        <div style="font-size:12px;color:var(--muted);line-height:1.8;margin-bottom:10px">
+          Sign in with Google to sync your data across all your devices automatically.
+          Your data is stored in <strong>your own Google Drive</strong> — private to you.
         </div>
-        <div id="ob1-google-status" style="font-size:11px;color:var(--success);text-align:center;margin-top:4px;min-height:14px"></div>
+        <button id="ob-google-signin-btn" onclick="obSignInGoogle()"
+          style="width:100%;background:#fff;color:#333;border:1px solid #ddd;border-radius:9px;padding:11px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px">
+          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Continue with Google
+        </button>
+        <button onclick="obNext(1)" style="width:100%;background:none;border:none;color:var(--muted);font-size:11px;cursor:pointer;font-family:inherit;padding:4px">
+          Skip — set up later in Settings
+        </button>
+        <div id="ob1-google-status" style="font-size:11px;color:var(--success);text-align:center;margin-top:6px;min-height:14px"></div>
       </div>
       <button class="btn btn-primary" style="margin-top:12px" onclick="obNext(1)">Continue →</button>
     </div></div>
@@ -1620,15 +1772,16 @@ document.addEventListener('DOMContentLoaded', function() {
         </div>
         <span id="wake-label" style="font-size:11px;color:var(--muted)">Voice: Off</span>
       </div>
-      <div class="cloud-status" id="cloud-status" title="Supabase cloud sync — configure in Settings" style="cursor:default">
+      <div class="cloud-status" id="cloud-status" title="Google Drive sync status — sign in via 👤" style="cursor:pointer;display:flex;align-items:center;gap:4px" onclick="showModal('auth-modal')">
         <span class="sync-dot" id="sync-dot"></span>
-        <span id="sync-label" style="font-size:11px;color:var(--muted)">Sync: Off</span>
+        <span id="sync-label" style="font-size:11px;color:var(--muted)">Drive: Off</span>
       </div>
       <button class="btn-icon" title="Add reminder" onclick="showModal('alarm-modal')">⏰</button>
       <button class="btn-icon" title="Export Excel" onclick="exportExcel()">📊</button>
-      <button class="btn-icon" id="auth-btn" title="Cloud sync info" onclick="showModal('auth-modal')">👤</button>
+      <button class="btn-icon" id="auth-btn" title="Sign in with Google / Backup & Sync" onclick="showModal('auth-modal')">👤</button>
       <button class="btn-icon" title="Help &amp; Guides" onclick="showModal('help-modal')" style="font-size:16px">❓</button>
-      <button class="btn-icon" title="Lock" onclick="lockApp()">🔒</button>
+      <button class="btn-icon" title="Lock app (returns to PIN)" onclick="lockApp()">🔒</button>
+      <button class="btn-icon" id="signout-btn" title="Sign out of Google / Switch account" onclick="signOutGoogle()" style="display:none;font-size:13px">⏏️</button>
     </div>
   </header>
   <!-- ── Renewal progress bar ─────────────────────────────── -->
@@ -1876,14 +2029,31 @@ document.addEventListener('DOMContentLoaded', function() {
         <div class="ai-panel" style="margin-top:16px">
           <div class="ai-panel-header">
             <span class="ai-badge">SETUP</span>
-            <span style="font-size:13px;font-weight:600">Claude AI Key (Required for drafting)</span><div style="margin:6px 0 0;padding:8px 10px;background:rgba(255,180,0,0.1);border:1px solid rgba(255,180,0,0.3);border-radius:6px;font-size:11px;color:var(--warn);line-height:1.5">⚠️ <strong>Security notice:</strong> Your API key is stored in this browser only and sent directly to Anthropic. Never use this app on a shared or public computer. <a href="javascript:void(0)" onclick="localStorage.removeItem('dcp_apikey');apiKey='';document.getElementById('api-key-input').value='';toast('API key cleared.','info');" style="color:var(--warn);text-decoration:underline">Clear key from storage</a></div>
+            <span style="font-size:13px;font-weight:600">🔑 Your Anthropic API Key</span>
           </div>
-          <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
-            Get a free API key at <strong>console.anthropic.com</strong>. Stored in your browser only.
-          </p>
-          <div style="display:flex;gap:8px">
-            <input type="password" id="api-key-input" placeholder="sk-ant-..." style="flex:1;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:9px 13px;color:var(--text);font-family:JetBrains Mono,monospace;font-size:12px;outline:none">
-            <button class="btn btn-primary btn-sm" onclick="saveApiKey()">Save</button>
+          <!-- Step-by-step setup -->
+          <div id="ai-setup-panel" style="margin-bottom:12px">
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text)">How to get your free API key (2 minutes):</div>
+            <div style="font-size:12px;color:var(--muted);line-height:2;margin-bottom:10px">
+              <strong style="color:var(--text)">1.</strong> Go to
+              <a href="https://console.anthropic.com/settings/api-keys" target="_blank" rel="noopener"
+                 style="color:var(--accent);text-decoration:underline;font-weight:600">console.anthropic.com/settings/api-keys</a>
+              → sign up free<br>
+              <strong style="color:var(--text)">2.</strong> Click <strong>Create Key</strong> → copy it (starts with <code style="background:var(--surface);padding:1px 5px;border-radius:4px">sk-ant-</code>)<br>
+              <strong style="color:var(--text)">3.</strong> Paste it below and tap <strong>Save</strong> — done!
+            </div>
+            <div id="ai-key-status" style="font-size:12px;margin-bottom:8px;min-height:16px"></div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input type="password" id="api-key-input" placeholder="sk-ant-api03-..." autocomplete="off"
+                style="flex:1;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 13px;color:var(--text);font-family:JetBrains Mono,monospace;font-size:12px;outline:none"
+                onkeydown="if(event.key==='Enter')saveApiKey()">
+              <button class="btn btn-primary" onclick="saveApiKey()" style="white-space:nowrap">💾 Save Key</button>
+            </div>
+            <div style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.6">
+              🔒 Key is stored only in this browser — never sent to any server except Anthropic directly.
+              New accounts get free credits (~₹400 worth). After that, top up at console.anthropic.com.
+              <a href="javascript:void(0)" onclick="clearApiKey()" style="color:var(--error);margin-left:8px">Clear saved key</a>
+            </div>
           </div>
         </div>
       </div>
@@ -1968,7 +2138,8 @@ document.addEventListener('DOMContentLoaded', function() {
             </div>
             <div id="pwa-settings-status" style="font-size:11px;color:var(--muted);margin-top:10px;display:none"></div>
           <div style="font-size:11px;color:var(--muted);margin-top:10px;padding:8px 10px;background:rgba(59,130,246,.06);border-radius:8px;line-height:1.6">
-            💡 Tip: Install the app on your device using the <strong>⊕ Install App</strong> button above, or follow the iOS instructions below.
+            💡 <strong>Tip:</strong> Tap <strong>⊕ Install App</strong> above (Android/Chrome) or
+            <a href="javascript:void(0)" onclick="document.getElementById('pwa-ios-hint').style.display='block';this.style.display='none'" style="color:var(--accent);text-decoration:underline;cursor:pointer">tap here for iPhone/iPad instructions</a>.
           </div>
             <!-- iOS manual instructions (shown when Chrome prompt unavailable) -->
             <div id="pwa-ios-hint" style="display:none;margin-top:12px;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:8px;padding:10px 12px;font-size:12px;color:var(--muted);line-height:1.7">
@@ -2183,24 +2354,37 @@ document.addEventListener('DOMContentLoaded', function() {
         <div class="settings-section">
           <h3>☁️ Backup &amp; Sync</h3>
 
-          <!-- Cross-device sync info -->
+          <!-- Google Drive Sync -->
           <div style="background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.15);border-radius:12px;padding:14px;margin-bottom:12px">
-            <div style="font-weight:700;font-size:13px;margin-bottom:6px">📱💻 Sync Across Devices</div>
-            <div style="font-size:12px;color:var(--muted);line-height:1.8">
-              To move your data to another device:<br>
-              1. Tap <strong style="color:var(--text)">📥 Backup my data</strong> below on this device<br>
-              2. Save the file to WhatsApp, Google Drive, or Email<br>
-              3. Open the file on your new device → tap <strong style="color:var(--text)">📤 Restore backup</strong>
+            <div style="font-weight:700;font-size:13px;margin-bottom:6px;display:flex;align-items:center;gap:6px">📱💻 Sync Across Devices</div>
+            <div style="font-size:12px;color:var(--muted);line-height:1.8;margin-bottom:10px">
+              Sign in with Google to automatically back up and sync your data across all your devices.
+              Your data is stored in <strong style="color:var(--text)">your own Google Drive</strong> — private to you.
             </div>
-            <div id="gdrive-status" style="font-size:11px;color:var(--muted);margin-top:6px;min-height:14px"></div>
+            <button onclick="obSignInGoogle()" id="settings-google-btn"
+              style="width:100%;background:#fff;color:#333;border:1px solid #ddd;border-radius:9px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px">
+              <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+              Sign in with Google
+            </button>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+              <button class="btn btn-secondary btn-sm" onclick="gdriveSync('push')" style="padding:9px">☁️ Save to Drive</button>
+              <button class="btn btn-secondary btn-sm" onclick="gdriveSync('pull')" style="padding:9px">📥 Load from Drive</button>
+            </div>
+            <div id="gdrive-status" style="font-size:11px;color:var(--muted);margin-top:4px;min-height:14px"></div>
             <div id="ob-google-status" style="display:none"></div>
-            <!-- FIX 8: Disconnect button -->
-            <div id="gdrive-connected-row" style="display:none;margin-top:10px;align-items:center;gap:10px">
+            <!-- Device manager — shown after sign-in -->
+            <div id="device-manager" style="display:none;margin-top:10px">
+              <div style="font-size:12px;font-weight:600;margin-bottom:6px;color:var(--text)">📱 Registered Devices (max 3)</div>
+              <div id="device-list" style="font-size:11px;color:var(--muted);line-height:2"></div>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px">To use a new device, remove one here first.</div>
+            </div>
+            <div id="gdrive-connected-row" style="display:none;margin-top:8px;align-items:center;gap:10px">
               <span style="font-size:12px;color:var(--success);flex:1">✅ Google Drive connected</span>
-              <button onclick="gdriveDisconnect()" style="background:none;border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:11px;color:var(--muted);cursor:pointer;font-family:inherit">Disconnect</button>
+              <button onclick="gdriveDisconnect()" style="background:none;border:1px solid var(--border);border-radius:8px;padding:5px 10px;font-size:11px;color:var(--muted);cursor:pointer;font-family:inherit">Disconnect</button>
             </div>
           </div>
 
+          <!-- Manual Backup -->
           <!-- Manual Backup -->
           <div style="background:var(--surface);border-radius:12px;padding:14px;border:1px solid var(--border)">
             <div style="font-weight:700;font-size:13px;margin-bottom:4px">💾 Manual Backup</div>
@@ -2766,24 +2950,24 @@ document.addEventListener('DOMContentLoaded', function() {
 <!-- Auth Modal -->
 <div class="modal-overlay" id="auth-modal">
   <div class="modal" style="max-width:440px">
-    <div class="modal-header"><h2>💾 Backup &amp; Sync</h2><button class="btn-icon" onclick="closeModal('auth-modal')">✕</button></div>
+    <div class="modal-header"><h2>☁️ Sign In / Sync</h2><button class="btn-icon" onclick="closeModal('auth-modal')">✕</button></div>
     <div class="modal-body">
-      <div style="text-align:center;margin-bottom:20px">
-        <div style="font-size:48px;margin-bottom:10px">💾</div>
-        <p style="font-size:14px;font-weight:600;margin-bottom:6px">Your data stays on your device</p>
-        <p style="font-size:12px;color:var(--muted);line-height:1.7">Zyps Task Pro works completely offline. No account needed. Use the backup options below to save or transfer your data.</p>
+      <div style="text-align:center;margin-bottom:16px">
+        <div style="font-size:48px;margin-bottom:8px">☁️</div>
+        <p style="font-size:14px;font-weight:600;margin-bottom:4px">Sync across devices</p>
+        <p style="font-size:12px;color:var(--muted);line-height:1.7">Sign in with Google to save your data to your own Google Drive. Access it on any device, anytime.</p>
       </div>
-      <button class="btn btn-primary" onclick="exportJSON();closeModal('auth-modal')"
-        style="justify-content:center;font-size:14px;padding:13px;margin-bottom:10px">
-        📥 Backup my data
+      <button onclick="closeModal('auth-modal');obSignInGoogle()" id="auth-google-btn"
+        style="width:100%;background:#fff;color:#333;border:1px solid #ddd;border-radius:9px;padding:12px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:12px">
+        <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+        Continue with Google
       </button>
-      <button class="btn btn-secondary" onclick="document.getElementById('import-json-input').click();closeModal('auth-modal')"
-        style="justify-content:center;font-size:14px;padding:13px;margin-bottom:10px">
-        📤 Restore backup
-      </button>
-      <div style="padding:10px 12px;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.7">
-        💡 To move data to another device: Backup → save file to WhatsApp/Drive/Email → open on new device → Restore.
+      <div style="text-align:center;color:var(--muted);font-size:11px;margin-bottom:12px">— or use manual backup —</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+        <button class="btn btn-secondary" onclick="exportJSON();closeModal('auth-modal')" style="font-size:12px;padding:10px">📥 Backup</button>
+        <button class="btn btn-secondary" onclick="document.getElementById('import-json-input').click();closeModal('auth-modal')" style="font-size:12px;padding:10px">📤 Restore</button>
       </div>
+      <div id="auth-modal-status" style="font-size:11px;color:var(--success);text-align:center;min-height:14px"></div>
     </div>
   </div>
 </div>
@@ -2804,38 +2988,41 @@ document.addEventListener('DOMContentLoaded', function() {
       </div>
       <div class="help-panel active" id="hpanel-whatsapp"><div class="help-section">
         <div class="help-icon">📱</div><h3>WhatsApp Integration</h3><p class="help-sub">Send messages directly from Zyps Task Pro</p>
-        <div class="guide-step"><div class="step-num">1</div><div><strong>No setup for basic use</strong>The WhatsApp button opens WhatsApp Web with a pre-filled message.</div></div>
-        <div class="guide-step"><div class="step-num">2</div><div><strong>AI-drafted messages</strong>Go to AI Draft tab → select contact → generate → click WhatsApp button.</div></div>
-        <div class="guide-step"><div class="step-num">3</div><div><strong>Twilio for automation (optional)</strong>Settings → Twilio section. Needs a Twilio account + WhatsApp sandbox for server-side sending.</div></div>
-        <div class="help-note">💡 The wa.me link method works for 95% of use cases. Twilio is only needed for fully automated no-click sending.</div>
+        <div class="guide-step"><div class="step-num">1</div><div><strong>No setup needed</strong> — the WhatsApp button opens WhatsApp with a pre-filled message. Works on mobile and desktop.</div></div>
+        <div class="guide-step"><div class="step-num">2</div><div><strong>AI-drafted messages</strong> — go to the AI Draft tab, select a contact, generate a message, then click the WhatsApp button to send it.</div></div>
+        <div class="guide-step"><div class="step-num">3</div><div><strong>Mail My Day</strong> — on the Today page, tap 📧 Email My Day or 💬 WhatsApp My Day to send yourself a summary of today's tasks.</div></div>
+        <div class="help-note">💡 WhatsApp links work for all devices — no API or subscription needed.</div>
       </div></div>
       <div class="help-panel" id="hpanel-gcal"><div class="help-section">
-        <div class="help-icon">📅</div><h3>Calendar Sync</h3><p class="help-sub">Add tasks to Google Calendar, Apple Calendar or Outlook — no setup needed</p>
-        <div class="guide-step"><div class="step-num">1</div><div><strong>Go to Settings → Calendar Sync</strong><br>Tap "Download .ics" for Follow-ups or Today's tasks.</div></div>
-        <div class="guide-step"><div class="step-num">2</div><div><strong>Open the downloaded file</strong><br>Your device asks which calendar app to use — tap Google Calendar, Apple Calendar, or Outlook.</div></div>
-        <div class="guide-step"><div class="step-num">3</div><div><strong>Done — all tasks imported as events</strong><br>Repeat any time to refresh your calendar with latest tasks.</div></div>
+        <div class="help-icon">📅</div><h3>Calendar Sync</h3><p class="help-sub">Export tasks to Google Calendar, Apple Calendar or Outlook</p>
+        <div class="guide-step"><div class="step-num">1</div><div><strong>No API key needed</strong> — go to Settings → Calendar Sync and tap the button to download a .ics file.</div></div>
+        <div class="guide-step"><div class="step-num">2</div><div><strong>Import the file</strong> — open the .ics file on your device. Your calendar app will offer to import all events automatically.</div></div>
+        <div class="guide-step"><div class="step-num">3</div><div><strong>Three export options</strong> — Follow-up tasks, Today's tasks, or All pending tasks.</div></div>
+        <div class="help-note">💡 Works with Google Calendar, Apple Calendar, Outlook, and any calendar that supports .ics files.</div>
       </div></div>
       <div class="help-panel" id="hpanel-email"><div class="help-section">
-        <div class="help-icon">📧</div><h3>Email Integration</h3><p class="help-sub">Draft and send AI-powered emails to contacts</p>
-        <div class="guide-step"><div class="step-num">1</div><div><strong>Basic email (no setup)</strong>Click 📧 on any contact to open your email client with address pre-filled.</div></div>
-        <div class="guide-step"><div class="step-num">2</div><div><strong>AI Draft</strong>AI Draft tab → select contact → choose type → Generate → Send via Email.</div></div>
-        <div class="guide-step"><div class="step-num">3</div><div><strong>Get API Key</strong>console.anthropic.com or platform.openai.com → API Keys → create and copy.</div></div>
-        <div class="guide-step"><div class="step-num">4</div><div><strong>Enter in Settings</strong>Settings → AI API Key → paste → Save. Stored only in your browser.</div></div>
+        <div class="help-icon">📧</div><h3>Email Integration</h3><p class="help-sub">Send emails and your daily summary directly from the app</p>
+        <div class="guide-step"><div class="step-num">1</div><div><strong>Send to a contact</strong> — tap the ✉️ button on any task row to open your email app with the contact's address and agenda pre-filled.</div></div>
+        <div class="guide-step"><div class="step-num">2</div><div><strong>AI draft</strong> — go to AI Draft tab, generate a message, then tap 📧 Open in Mail to send it via your email app.</div></div>
+        <div class="guide-step"><div class="step-num">3</div><div><strong>Mail My Day</strong> — on the Today page tap 📧 Email My Day. Your email app opens with a full day summary ready to send to yourself.</div></div>
+        <div class="help-note">💡 All email links open your default email app (Gmail, Outlook, Apple Mail etc.) — no setup needed.</div>
       </div></div>
       <div class="help-panel" id="hpanel-voice"><div class="help-section">
-        <div class="help-icon">🎤</div><h3>Voice Assistant</h3><p class="help-sub">Hands-free control with your wake word</p>
-        <div class="guide-step"><div class="step-num">1</div><div><strong>Allow microphone once</strong>Browser asks on first use — click Allow. Chrome remembers this permanently.</div></div>
-        <div class="guide-step"><div class="step-num">2</div><div><strong>Set wake word</strong>Settings → Voice Assistant → type your wake word (default: "connect") → Save.</div></div>
-        <div class="guide-step"><div class="step-num">3</div><div><strong>Activate</strong>Click 🎤 in header to turn on. Say your wake word to activate, then speak your command.</div></div>
-        <div class="guide-step"><div class="step-num">4</div><div><strong>Commands</strong><code style="background:var(--surface);padding:6px 10px;border-radius:6px;display:block;margin-top:6px;font-size:11px;line-height:2">"connect, add task" · "connect, search [name]" · "connect, show today" · "connect, open pipeline"</code></div></div>
-        <div class="help-note">⚠️ Voice requires Chrome or Edge. Firefox and Safari do not support this.</div>
+        <div class="help-icon">🎤</div><h3>Voice Assistant</h3><p class="help-sub">Hands-free control with your custom wake word</p>
+        <div class="guide-step"><div class="step-num">1</div><div><strong>Allow microphone</strong> — your browser asks once on first use. Click Allow. Works on Chrome and Edge only.</div></div>
+        <div class="guide-step"><div class="step-num">2</div><div><strong>Set your wake word</strong> — Settings → Voice Assistant → type a word (e.g. "Connect", "Hey Zyps") → Save.</div></div>
+        <div class="guide-step"><div class="step-num">3</div><div><strong>Activate</strong> — tap the 🎤 icon in the header. Say your wake word, then say a command like "add task" or "show today".</div></div>
+        <div class="guide-step"><div class="step-num">4</div><div><strong>Sensitivity</strong> — set to High for noisy environments, Low for quiet rooms where you want fewer false triggers.</div></div>
+        <div class="help-note">💡 Voice requires Chrome or Edge on HTTPS. The app must be open in the browser tab.</div>
       </div></div>
       <div class="help-panel" id="hpanel-export"><div class="help-section">
-        <div class="help-icon">📊</div><h3>Export &amp; Import</h3><p class="help-sub">Back up and restore your data</p>
-        <div class="guide-step"><div class="step-num">1</div><div><strong>Export to Excel</strong>Click 📊 in the header. Downloads all tasks as a formatted Excel file.</div></div>
-        <div class="guide-step"><div class="step-num">2</div><div><strong>JSON backup</strong>Settings → Data Management → Export JSON. Saves everything including settings and alarms.</div></div>
-        <div class="guide-step"><div class="step-num">3</div><div><strong>Import JSON</strong>Settings → Import JSON → select backup file. All data restored instantly.</div></div>
-        <div class="guide-step"><div class="step-num">4</div><div><strong>Cloud sync</strong>Click 👤 in header → Sign in with Google or email. Data syncs automatically across devices.</div></div>
+        <div class="help-icon">📊</div><h3>Export, Backup &amp; Sync</h3><p class="help-sub">Keep your data safe and transfer it across devices</p>
+        <div class="guide-step"><div class="step-num">1</div><div><strong>Export to Excel</strong> — tap 📊 in the header. Downloads all tasks as a formatted Excel file.</div></div>
+        <div class="guide-step"><div class="step-num">2</div><div><strong>JSON backup</strong> — Settings → Backup &amp; Sync → Backup my data. Saves everything (tasks, settings, alarms).</div></div>
+        <div class="guide-step"><div class="step-num">3</div><div><strong>Move to another device</strong> — Backup on old device → save file to WhatsApp/Email/Drive → open on new device → Restore backup.</div></div>
+        <div class="guide-step"><div class="step-num">4</div><div><strong>Google Drive sync</strong> — tap 👤 in the header → Sign in with Google. Data syncs to your own Google Drive automatically. Works across up to 3 devices.</div></div>
+        <div class="guide-step"><div class="step-num">5</div><div><strong>AI drafting</strong> — get a free Anthropic API key at <strong>console.anthropic.com</strong> → paste it in the AI Draft tab → Setup section. You call Anthropic directly — no limits, no middleman.</div></div>
+        <div class="help-note">💡 Google Drive sync requires a one-time Google sign-in. Your data is stored in your own private Drive — not on any Zyps server.</div>
       </div></div>
     </div>
   </div>
@@ -3026,6 +3213,12 @@ let pin      = ''; // Never store plaintext PIN in memory — zeroed immediately
 let editIdx  = -1;
 let pinBuffer = '';
 let apiKey = localStorage.getItem('dcp_apikey') || '';
+// Show key status in AI setup panel on load
+document.addEventListener('DOMContentLoaded', function() {
+  const st = document.getElementById('ai-key-status');
+  if (st && apiKey) { st.textContent = '✅ API key is saved. You\'re ready to draft.'; st.style.color = 'var(--success)'; }
+  else if (st) { st.textContent = 'No key saved yet — follow the steps below.'; st.style.color = 'var(--warn)'; }
+});
 let csvPendingData = [];
 let activityLog = (function(){try{const r=localStorage.getItem('dcp_activity');return r?JSON.parse(r).slice(-200):[];}catch(e){console.error('[DTP] activityLog parse:',e);return [];}})();
 
@@ -4652,8 +4845,10 @@ function renderKanban() {
             const realIdx = tasks.indexOf(t);
             return `
               <div class="kanban-card" draggable="true"
-                   ondragstart="kanbanDragStart(event,${realIdx})"
-                   ondragend="this.classList.remove('dragging')">
+                   style="cursor:pointer"
+                   ondragstart="kanbanDragStart(event,${realIdx});event.stopPropagation()"
+                   ondragend="this.classList.remove('dragging')"
+                   onclick="editTask(${realIdx})">
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                   ${t.personPhoto ? `<img src="${safeSrc(t.personPhoto)}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;flex-shrink:0">` : ''}
                   <div class="kanban-card-org">${esc(t.org)}</div>
@@ -4662,8 +4857,7 @@ function renderKanban() {
                 <div class="kanban-card-meta">
                   ${meetBadge(t.meeting)}
                   <div style="display:flex;gap:4px">
-                    <button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:11px" onclick="editTask(${realIdx})">✏️</button>
-                    <button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:11px" onclick="showQRCard(${realIdx})">📇</button>
+                    <button class="btn btn-secondary btn-sm" style="padding:3px 7px;font-size:11px" onclick="event.stopPropagation();showQRCard(${realIdx})" title="View contact card">📇</button>
                   </div>
                 </div>
                 ${t.followup ? `<div style="font-size:10px;color:var(--warn);margin-top:6px">📅 Follow-up: ${esc(t.followup)}</div>` : ''}
@@ -4924,10 +5118,12 @@ function saveSupabaseSettings() {
 function updateSyncStatus() {
   const dot = document.getElementById('sync-dot');
   const label = document.getElementById('sync-label');
-  if (settings.sbUrl && settings.sbKey) {
-    dot.className = 'sync-dot connected'; label.textContent = 'Sync: On';
-  } else {
-    dot.className = 'sync-dot'; label.textContent = 'Sync: Off';
+  if (dot && label) {
+    if (localStorage.getItem('gdrive_signed_in') === '1') {
+      dot.className = 'sync-dot connected'; label.textContent = 'Drive: On';
+    } else {
+      dot.className = 'sync-dot'; label.textContent = 'Drive: Off';
+    }
   }
 }
 
@@ -5701,37 +5897,48 @@ function loadAIDropdown() {
     tasks.map((t,i) => `<option value="${i}">${esc(t.date)} | ${esc(t.org)} | ${esc(t.contact)}</option>`).join('');
 }
 
+function clearApiKey() {
+  localStorage.removeItem('dcp_apikey');
+  apiKey = '';
+  const inp = document.getElementById('api-key-input');
+  if (inp) inp.value = '';
+  const st = document.getElementById('ai-key-status');
+  if (st) { st.textContent = 'Key cleared.'; st.style.color = 'var(--muted)'; }
+  toast('API key cleared.', 'info');
+}
+
 function saveApiKey() {
   const inp = document.getElementById('api-key-input');
   const val = inp.value.trim();
+  if (!val) { toast('Please paste your API key first.', 'error'); return; }
+  if (!val.startsWith('sk-ant-')) { toast('That doesn\'t look like an Anthropic key — it should start with sk-ant-', 'error'); return; }
   if (val) {
     apiKey = val;
     safeSave('dcp_apikey', apiKey);
     inp.value = '';
-    inp.placeholder = '✓ Key saved — type new key to replace';
-    toast('API key saved securely.', 'success');
+    inp.placeholder = '✓ Key saved — paste new key to update';
+    const st = document.getElementById('ai-key-status');
+    if (st) { st.textContent = '✅ API key saved! You can now use AI drafting.'; st.style.color = 'var(--success)'; }
+    toast('✅ API key saved! Tap "Draft with AI" to start.', 'success');
   } else {
     toast('Please enter your API key.', 'error');
   }
 }
 
 async function draftMessage() {
-  // Rate limiting — 5s cooldown, 20 calls per day
-  const _rlNow = Date.now();
-  const _rlLast = parseInt(sessionStorage.getItem('ai_last_call') || '0');
-  if (_rlNow - _rlLast < 5000) { toast('Please wait a moment before drafting again.','error'); return; }
-  const _rlDayKey = 'ai_calls_' + new Date().toDateString();
-  const _rlCalls = parseInt(localStorage.getItem(_rlDayKey) || '0');
-  if (_rlCalls >= 20) { toast('Daily AI draft limit reached (20/day). Resets tomorrow.','error'); return; }
-  sessionStorage.setItem('ai_last_call', String(_rlNow));
-  localStorage.setItem(_rlDayKey, String(_rlCalls + 1));
-  localStorage.removeItem('ai_calls_' + new Date(Date.now() - 86400000).toDateString());
+  // No rate limiting — user pays Anthropic directly with their own API key
   const idx  = document.getElementById('ai-task-select').value;
   const type = document.getElementById('ai-msg-type').value;
   const sender = document.getElementById('ai-sender').value.trim();
   const extra  = document.getElementById('ai-instructions').value.trim();
   if (idx==='') { toast('Please select a task first.','error'); return; }
-  if (!apiKey || !apiKey.trim())  { toast('Please enter your Anthropic API key in the Setup section below.','error'); return; }
+  if (!apiKey || !apiKey.trim()) {
+    toast('No API key set. Scroll down to the Setup section and paste your Anthropic API key.', 'error');
+    // Scroll to setup section
+    const setupEl = document.getElementById('ai-setup-panel');
+    if (setupEl) setupEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return;
+  }
   apiKey = apiKey.trim();
   const _tIdx = parseInt(idx);
   const t = tasks[_tIdx];
@@ -5746,32 +5953,8 @@ async function draftMessage() {
   panel.style.display='block';
   output.innerHTML = '<span class="ai-loading">✨ Drafting with AI...</span>';
   document.getElementById('ai-result-label').textContent = type==='whatsapp' ? 'WhatsApp Draft' : 'Email Draft';
-  const _aiWebhook = APP_CONFIG.ORDERS_WEBHOOK;
-  // Path A: proxy through Apps Script (key stays server-side, recommended)
-  if (_aiWebhook && _aiWebhook !== 'YOUR_WEBHOOK_URL') {
-    try {
-      const resp = await fetch(_aiWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'proxyAI', prompt })
-      });
-      const data = await resp.json();
-      if (data.error) { output.textContent = 'Error: ' + data.error; return; }
-      output.textContent = data.text || 'No response.';
-      toast('Draft ready! Review and edit before sending.', 'success');
-    } catch(e) {
-      output.textContent = 'Error connecting to AI proxy. Check your Apps Script deployment.';
-      logError('aiProxy', e);
-      toast('AI draft failed.', 'error');
-    }
-    return;
-  }
-  // Path B: direct browser call (fallback — only if webhook not configured)
-  // Note: API key is stored in localStorage; only use on a trusted private device
-  if (!apiKey || !apiKey.trim()) {
-    output.textContent = 'Configure your Anthropic API key in Settings, or set up the Apps Script proxy.';
-    return;
-  }
+  // User's own Anthropic key — they pay directly, no limits on our end
+  // Key stored in localStorage('dcp_apikey'), sent only to api.anthropic.com
   try {
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
@@ -7089,13 +7272,31 @@ function getIncomingRefCoupon() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 async function obSignInGoogle() {
-  // Google OAuth requires a Client ID to be configured.
-  // For now, guide user to use manual backup for cross-device sync.
   const status1 = document.getElementById('ob1-google-status');
   const btn1    = document.getElementById('ob-google-signin-btn');
-  if (status1) status1.textContent = 'Use Settings → Backup to sync between devices';
-  if (btn1) btn1.style.opacity = '.5';
-  toast('For device sync: use Settings → 📥 Backup my data, then restore on your new device.', 'info');
+  if (_gdriveClientId === 'YOUR_GOOGLE_CLIENT_ID') {
+    if (status1) status1.textContent = 'Google sign-in not configured yet — use Settings → Backup to move data';
+    toast('Google Client ID not set up yet. Use Settings → 📥 Backup my data for now.', 'info');
+    return;
+  }
+  if (btn1) { btn1.disabled = true; btn1.textContent = 'Signing in…'; }
+  if (status1) status1.textContent = 'Connecting to Google…';
+  try {
+    await _gdriveGetToken();
+    safeSave('gdrive_signed_in', '1');
+    if (status1) status1.textContent = 'Signed in! Loading your data from Drive…';
+    // Auto-pull data (tasks + profile/settings) so user doesn't re-enter details
+    try { await gdriveSync('pull'); } catch(_) {}
+    // Reload settings UI with pulled profile
+    if (typeof loadSettings === 'function') loadSettings();
+    if (status1) status1.textContent = '✅ Signed in! Profile & tasks loaded from Google Drive.';
+    if (btn1) { btn1.textContent = '✅ Signed in'; btn1.style.background = 'var(--success)'; }
+    toast('✅ Signed in with Google! Profile and data loaded.', 'success');
+  } catch(e) {
+    if (status1) status1.textContent = 'Sign-in failed: ' + e.message;
+    if (btn1) { btn1.disabled = false; btn1.innerHTML = '<svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg> Continue with Google'; }
+    logError('obSignInGoogle', e);
+  }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 function obFinish() {
@@ -7859,4 +8060,3 @@ window.addEventListener('pagehide', function() {
   &copy; 2025 Zyps. All rights reserved. Zyps Task Pro is the exclusive property of Zyps.<br>
   Unauthorized copying, modification, or distribution is strictly prohibited.
 </div>
-
