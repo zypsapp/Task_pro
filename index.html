@@ -930,7 +930,7 @@ var _gdriveTokenExp = 0;
 // ▼▼▼ PASTE YOUR GOOGLE OAUTH2 CLIENT ID HERE ▼▼▼
 // Get it from: console.cloud.google.com → APIs & Services → Credentials → OAuth2 Client ID
 // Authorised origin must include: https://task.zypsapp.com
-var _gdriveClientId = 519542609285-1gb2infl6iors52v199nbfbpuo894uaa.apps.googleusercontent.com;
+var _gdriveClientId ='519542609285-1gb2infl6iors52v199nbfbpuo894uaa.apps.googleusercontent.com';
 
 function _gdriveSignIn() {
   return new Promise(function(resolve, reject) {
@@ -6286,7 +6286,7 @@ function toast(msg, type='info') {
 // ══════════════════════════════════════════════
 const APP_CONFIG = {
   UPI_ID:              'YOUR_UPI_ID@upi',    // ← replace with your actual UPI ID
-  ORDERS_WEBHOOK:      'YOUR_WEBHOOK_URL',  // ← paste Google Apps Script URL here
+  ORDERS_WEBHOOK:      'https://script.google.com/macros/s/AKfycbz_CKPuyaB-Ogi6aOv6bYXW1z_hFjpPq98bnTz4mcXpvpGnzsvwhGEYIVOxHoLph7S7fA/exec',  // ← paste Google Apps Script URL here
   // SECURITY: also add your GAS deployment URL to the CSP connect-src in <head> (see comment there)
   UPI_NAME:            'Zyps Task Pro',
   SUPPORT_WHATSAPP:    '919876543210',
